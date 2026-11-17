@@ -55,9 +55,46 @@ def kalman(measurements: list[tuple[Points, Points] | None]) -> list[np.ndarray 
     return states
 
 
+def reappearance(measurements: list[tuple[Points, Points] | None]) -> int:
+    best, r, length = 0, 0, 0
+    for i, m in enumerate(measurements):
+        if m is None:
+            length += 1
+        else:
+            if length > best and i - length > 0:
+                best, r = length, i
+            length = 0
+    return r
+
+
+def track(measurements: list[tuple[Points, Points] | None]):
+    sigma_pos, sigma_vel = estimate_measurement_noise(measurements)
+    first = next(i for i, m in enumerate(measurements) if m is not None)
+    r = reappearance(measurements)
+    kf = KalmanTracker(measurements[first], sigma_pos, sigma_vel)
+    states: list[np.ndarray | None] = [None] * first + [kf.state]
+    predicted = None
+    ghost = np.empty((0, 4))
+    for i in range(first + 1, len(measurements)):
+        kf.predict()
+        if i == r:
+            predicted = kf.state
+            ghost = np.vstack([predicted, kf.forecast(len(measurements) - r - 1)])
+        if measurements[i] is not None:
+            kf.correct(measurements[i])
+        states.append(kf.state)
+    measured = [m is not None for m in measurements]
+    error = np.linalg.norm(predicted[:2] - measurements[r][0])
+    real = np.array([s[:2] for s in states[r:]])
+    drift = np.linalg.norm(ghost[-1, :2] - real[-1])
+    return states, measured, r, ghost, error, drift
+
+
 if __name__ == "__main__":
     for video in sorted(Path("in").glob("*.mp4")):
         measurements = optical_flow(video)
         states = kalman(measurements)
         print(f"{video.name}: measured {sum(m is not None for m in measurements)}/{len(measurements)} frames, "
               f"final KF state {np.round(states[-1], 1)}")
+        _, _, r, _, error, drift = track(measurements)
+        print(f"{video.name}: reappears at frame {r}, error {error:.1f} px, ghost drift at end {drift:.1f} px")

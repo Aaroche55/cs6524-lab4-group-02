@@ -1,11 +1,11 @@
 """Step 3: constant-velocity Kalman filter fed with optical-flow position + velocity.
 
 State       x = [px, py, vx, vy]  (pixels, pixels/frame)
-Measurement z = [px, py, vx, vy]  (median position and median flow of the moving keypoints, see main.py)
+Measurement z = [px, py, vx, vy]  (anchor point moved by the object's median flow, and that flow; see main.py)
 Time step   dt = 1 frame
 
 Usage:
-    sigma_pos, sigma_vel = estimate_measurement_noise(measurements)
+    sigma_pos, sigma_vel = estimate_measurement_noise(measurements, centroids)
     kf = KalmanTracker(first_measurement, sigma_pos, sigma_vel)
     for z in later_measurements:          # z is (position, velocity) or None
         state = kf.step(z)                # predict, + correct when z is not None
@@ -22,23 +22,31 @@ Vec = npt.NDArray[np.float32]
 Measurement = tuple[Vec, Vec] | None  # (position, velocity) from optical flow, None = not measured
 
 SIGMA_ACC = 0.1  # px/frame^2, std of the unmodelled acceleration (process noise), tuned on the 3 videos
+MIN_PAIRS = 10  # consecutive measured frames needed to estimate R from the video itself
+DEFAULT_SIGMA_POS, DEFAULT_SIGMA_VEL = 10.0, 0.5  # px, px/frame
 
 
-def estimate_measurement_noise(measurements: Sequence[Measurement]) -> tuple[Vec, Vec]:
+def estimate_measurement_noise(
+    measurements: Sequence[Measurement], centroids: Sequence[Vec | None]
+) -> tuple[Vec, Vec]:
     """Std of the OF position and velocity measurement noise, estimated from the video itself.
 
-    If p, v were perfect, p_t = p_{t-1} + v_t and v_t = v_{t-1} (constant velocity). Each residual
-    is the difference of two independent noisy measurements, so its std is ~sqrt(2) * sigma.
+    Velocity: if it were perfect, v_t = v_{t-1} (constant velocity). Each residual is the difference
+    of two independent noisy measurements, so its std is ~sqrt(2) * sigma.
+    Position: the measured position is an anchor moved by the flow, so p_t - p_{t-1} - v_t is ~0 and
+    says nothing. Instead we use how far the anchor sits from the raw keypoint centroid of the object.
     MAD instead of std, because a few keypoint glitches (100 px jumps) would otherwise dominate.
     """
     pairs = [(a, b) for a, b in zip(measurements, measurements[1:]) if a is not None and b is not None]
-    res_pos = np.array([b[0] - a[0] - b[1] for a, b in pairs])
+    offsets = [c - m[0] for m, c in zip(measurements, centroids) if m is not None and c is not None]
+    if len(pairs) < MIN_PAIRS:  # too few to estimate (e.g. 04.mp4): fall back to typical values of 01-03
+        return np.full(2, DEFAULT_SIGMA_POS, np.float32), np.full(2, DEFAULT_SIGMA_VEL, np.float32)
     res_vel = np.array([b[1] - a[1] for a, b in pairs])
 
     def robust_std(r: np.ndarray) -> Vec:
-        return (1.4826 * np.median(np.abs(r - np.median(r, axis=0)), axis=0) / np.sqrt(2)).astype(np.float32)
+        return (1.4826 * np.median(np.abs(r - np.median(r, axis=0)), axis=0)).astype(np.float32)
 
-    return robust_std(res_pos), robust_std(res_vel)
+    return robust_std(np.array(offsets)), robust_std(res_vel) / np.float32(np.sqrt(2))
 
 
 class KalmanTracker:

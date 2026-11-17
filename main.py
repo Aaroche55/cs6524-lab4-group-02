@@ -4,37 +4,44 @@ import cv2
 import numpy as np
 
 from mypylibs.kalman import KalmanTracker, estimate_measurement_noise
-from mypylibs.optical_flow import Points, track_moving_points
+from mypylibs.optical_flow import Group, Points, group_points, track_moving_points
 
-MIN_POINTS = 5  # fewer moving keypoints than this = no measurement (e.g. object hidden)
+MAX_TURN_DEGREES = 45  # the objects move in straight lines, so anything heading another way isn't the object
 
 
 def optical_flow(video: Path) -> list[tuple[Points, Points] | None]:
     """Write out/XX_of.mp4 and return (position, velocity) per frame, or None if not measured."""
     cap = cv2.VideoCapture(str(video))
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(f"out/{video.stem}_of.mp4", cv2.VideoWriter_fourcc(*"mp4v"), cap.get(cv2.CAP_PROP_FPS), (w, h))
+    out = cv2.VideoWriter(
+        f"out/{video.stem}_of.mp4", cv2.VideoWriter_fourcc(*"mp4v"), cap.get(cv2.CAP_PROP_FPS), (w, h)
+    )
 
     _, frame = cap.read()
     prev = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     measurements: list[tuple[Points, Points] | None] = [None]
+    points = np.empty((0, 2), np.float32)
+    last_velocity: Points | None = None
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         curr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        start, end = track_moving_points(prev, curr)
+        start, end = track_moving_points(prev, curr, points)
+        points = end
 
         for a, b in zip(start, end):
-            cv2.arrowedLine(frame, a.astype(int), (a + 3 * (b - a)).astype(int), (0, 255, 0), 1)  # green = keypoint flow (3x longer)
+            cv2.arrowedLine(
+                frame, a.astype(int), (a + 3 * (b - a)).astype(int), (0, 255, 0), 1
+            )  # green = keypoint flow (3x longer)
 
-        if len(start) >= MIN_POINTS:
-            position, velocity = np.median(end, axis=0), np.median(end - start, axis=0)
-            cv2.circle(frame, position.astype(int), 8, (0, 0, 255), -1)  # red = object
-            measurements.append((position, velocity))
-        else:
-            measurements.append(None)
+        groups = group_points(start, end, frame.shape)
+        obj = pick_object(groups, last_velocity)
+        if obj is not None:
+            last_velocity = obj[1]
+            cv2.circle(frame, obj[0].astype(int), 8, (0, 0, 255), -1)  # red = object
+        measurements.append(obj)
 
         out.write(frame)
         prev = curr
@@ -44,13 +51,29 @@ def optical_flow(video: Path) -> list[tuple[Points, Points] | None]:
     return measurements
 
 
+def pick_object(groups: list[Group], last_velocity: Points | None) -> Group | None:
+    """The fastest group heading the same way the object last did.
+
+    Ignores other moving things (the hand pulling back in video 03) and LK glitches at the occluder's
+    edges (points sliding up/down the edge), since those move in a different direction.
+    """
+    if last_velocity is not None:
+        groups = [g for g in groups if angle_between(g[1], last_velocity) < MAX_TURN_DEGREES]
+    return max(groups, key=lambda g: np.linalg.norm(g[1]), default=None)
+
+
+def angle_between(a: Points, b: Points) -> float:
+    cos = a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+
+
 def kalman(measurements: list[tuple[Points, Points] | None]) -> list[np.ndarray | None]:
     """Filtered [px, py, vx, vy] per frame (None before the first measurement)."""
     sigma_pos, sigma_vel = estimate_measurement_noise(measurements)
     first = next(i for i, m in enumerate(measurements) if m is not None)
     kf = KalmanTracker(measurements[first], sigma_pos, sigma_vel)
     states: list[np.ndarray | None] = [None] * first + [kf.state]
-    for m in measurements[first + 1:]:
+    for m in measurements[first + 1 :]:
         states.append(kf.step(m))
     return states
 
@@ -90,11 +113,54 @@ def track(measurements: list[tuple[Points, Points] | None]):
     return states, measured, r, ghost, error, drift
 
 
+BLUE, RED, PINK = (255, 0, 0), (0, 0, 255), (255, 0, 255)  # BGR
+
+
+def plot_trajectories(
+    video: Path,
+    states: list[np.ndarray | None],
+    measurements: list[tuple[Points, Points] | None],
+    r: int,
+    ghost: np.ndarray,
+) -> None:
+    """Write out/XX_tr.mp4: the object's trail so far, coloured by where each point came from."""
+    cap = cv2.VideoCapture(str(video))
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(
+        f"out/{video.stem}_tr.mp4", cv2.VideoWriter_fourcc(*"mp4v"), cap.get(cv2.CAP_PROP_FPS), (w, h)
+    )
+
+    last_seen = max(i for i, m in enumerate(measurements) if m is not None)  # object stops moving after this
+    for i in range(len(states)):
+        _, frame = cap.read()
+        for j in range(min(i, last_seen) + 1):  # trail up to the current frame
+            if states[j] is not None:
+                cv2.circle(frame, states[j][:2].astype(int), 3, BLUE if measurements[j] is not None else RED, -1)
+                if j % 10 == 0:  # velocity arrow every 10 frames (5x longer to be visible)
+                    p, v = states[j][:2], states[j][2:]
+                    cv2.arrowedLine(frame, p.astype(int), (p + 5 * v).astype(int), (255, 255, 255), 2)
+            if j >= r:
+                cv2.circle(frame, ghost[j - r][:2].astype(int), 3, PINK, -1)
+
+        legend = [("seen", BLUE), ("hidden: filter's guess", RED), ("filter's guess if it had stayed hidden", PINK)]
+        for k, (text, colour) in enumerate(legend):  # small, bottom-left, out of the way
+            y = h - 15 - 25 * (len(legend) - 1 - k)
+            cv2.putText(frame, text, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+            cv2.putText(frame, text, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
+        out.write(frame)
+
+    cap.release()
+    out.release()
+
+
 if __name__ == "__main__":
     for video in sorted(Path("in").glob("*.mp4")):
         measurements = optical_flow(video)
         states = kalman(measurements)
-        print(f"{video.name}: measured {sum(m is not None for m in measurements)}/{len(measurements)} frames, "
-              f"final KF state {np.round(states[-1], 1)}")
-        _, _, r, _, error, drift = track(measurements)
+        print(
+            f"{video.name}: measured {sum(m is not None for m in measurements)}/{len(measurements)} frames, "
+            f"final KF state {np.round(states[-1], 1)}"
+        )
+        tracked_states, _, r, ghost, error, drift = track(measurements)
         print(f"{video.name}: reappears at frame {r}, error {error:.1f} px, ghost drift at end {drift:.1f} px")
+        plot_trajectories(video, tracked_states, measurements, r, ghost)
